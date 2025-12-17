@@ -44,6 +44,9 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Load .env file first
+    dotenvy::dotenv().ok();
+
     info!("🎯 Arb Bot v2.0");
     info!("   Threshold: <{:.1}¢ for {:.1}% profit",
           ARB_THRESHOLD * 100.0, (1.0 - ARB_THRESHOLD) * 100.0);
@@ -62,7 +65,6 @@ async fn main() -> Result<()> {
     info!("[KALSHI] API key loaded");
 
     // Load Polymarket credentials
-    dotenvy::dotenv().ok();
     let poly_private_key = std::env::var("POLY_PRIVATE_KEY")
         .context("POLY_PRIVATE_KEY not set")?;
     let poly_funder = std::env::var("POLY_FUNDER")

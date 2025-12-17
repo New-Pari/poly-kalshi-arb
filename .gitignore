@@ -8,3 +8,4 @@ positions.json
 .discovery_cache.json
 
 secrets/
+etc/

@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use arb_bot::config::POLYMARKET_WS_URL;
 use arb_bot::polymarket_clob::{PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
+use arb_bot::position_tracker::{FillRecord, PositionTracker, PositionChannel, create_position_channel, position_writer_loop};
 use arb_bot::updown_scanner::{ActiveUpDownMarket, UpDownScanner};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -22,15 +23,22 @@ const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
 /// Polygon chain ID
 const POLYGON_CHAIN_ID: u64 = 137;
 
+/// Position tracking file (separate from main arb bot)
+const POSITIONS_FILE: &str = "positions_updown.json";
+
 /// Arbitrage threshold - sum of YES + NO must be below this for execution
 /// Example: 0.94 means 94¢, which gives 6% profit (100¢ - 94¢ = 6¢)
-const ARB_THRESHOLD: f64 = 0.94;
+const ARB_THRESHOLD: f64 = 0.995;
 
 /// Minimum size to trade (in dollars)
-const MIN_TRADE_SIZE: f64 = 10.0;
+const MIN_TRADE_SIZE: f64 = 1.0;
 
 /// Maximum size to trade per leg (in dollars)
-const MAX_TRADE_SIZE: f64 = 100.0;
+const MAX_TRADE_SIZE: f64 = 50.0;
+
+/// Buffer time before market ends to preload next market (seconds)
+/// Example: 60s means we start watching the next 15-min market 1 minute early
+const PRELOAD_BUFFER_SECS: u64 = 60;
 
 /// WebSocket book snapshot
 #[derive(Deserialize, Debug)]
@@ -155,49 +163,139 @@ async fn main() -> Result<()> {
 
     info!("[POLYMARKET] Client ready");
 
+    // Create position tracker with separate file
+    let position_tracker = Arc::new(RwLock::new(PositionTracker::load_from(POSITIONS_FILE)));
+    let (position_channel, position_rx) = create_position_channel();
+
+    // Spawn position writer task
+    let tracker_clone = position_tracker.clone();
+    tokio::spawn(position_writer_loop(position_rx, tracker_clone));
+
+    // Print initial position summary
+    {
+        let tracker = position_tracker.read().await;
+        let summary = tracker.summary();
+        info!("[POSITIONS] Loaded from {}", POSITIONS_FILE);
+        info!("   Open positions: {}", summary.open_positions);
+        info!("   Daily P&L: ${:.2}", tracker.daily_pnl());
+        info!("   All-time P&L: ${:.2}", tracker.all_time_pnl);
+    }
+
     // Create scanner
     let scanner = UpDownScanner::new();
 
     // Shared state for active markets
     let markets: Arc<RwLock<HashMap<String, MarketState>>> = Arc::new(RwLock::new(HashMap::new()));
 
-    // Market scanner task - refreshes every 30s
+    // Market scanner task - scans on market expiry with preload buffer
     let scanner_markets = markets.clone();
     let scanner_handle = tokio::spawn(async move {
-        let mut interval = interval(Duration::from_secs(30));
         loop {
-            interval.tick().await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
 
-            match scanner.scan_active_markets().await {
+            // Scan for current interval markets
+            match scanner.scan_markets_for_interval(0).await {
                 Ok(active_markets) => {
+                    if active_markets.is_empty() {
+                        warn!("[SCANNER] No active markets found, retrying in 10s...");
+                        sleep(Duration::from_secs(10)).await;
+                        continue;
+                    }
+
                     let mut map = scanner_markets.write().await;
 
-                    // Remove expired markets
-                    let active_tokens: Vec<String> = active_markets
-                        .iter()
-                        .flat_map(|m| vec![m.yes_token.clone(), m.no_token.clone()])
-                        .collect();
+                    // Get end time (all current markets have same end time)
+                    let current_end_time = active_markets[0].end_timestamp;
 
-                    map.retain(|_, state| {
-                        active_tokens.contains(&state.yes_token)
-                    });
-
-                    // Add new markets
+                    // Add current markets
                     for market in &active_markets {
                         if !map.contains_key(&market.yes_token) {
+                            info!("[SCANNER] Current: {} (ends in {}s)",
+                                  market.asset.to_uppercase(),
+                                  current_end_time.saturating_sub(now));
                             map.insert(market.yes_token.clone(), MarketState::new(market));
                         }
                     }
 
-                    info!("[SCANNER] {} active markets: {}",
-                          map.len(),
-                          map.values()
-                            .map(|m| m.asset.to_uppercase())
-                            .collect::<Vec<_>>()
-                            .join(", "));
+                    drop(map);
+
+                    // Calculate when to preload next interval
+                    let preload_time = current_end_time.saturating_sub(PRELOAD_BUFFER_SECS);
+                    let time_until_preload = preload_time.saturating_sub(now);
+
+                    if time_until_preload > 0 {
+                        info!("[SCANNER] {} active markets | preload in {}s | next scan at expiry+{}s",
+                              active_markets.len(),
+                              time_until_preload,
+                              PRELOAD_BUFFER_SECS);
+
+                        // Sleep until preload time
+                        sleep(Duration::from_secs(time_until_preload)).await;
+                    }
+
+                    // Preload next interval markets
+                    info!("[SCANNER] Preloading next interval ({}s early)...", PRELOAD_BUFFER_SECS);
+
+                    match scanner.scan_markets_for_interval(1).await {
+                        Ok(next_markets) => {
+                            let mut map = scanner_markets.write().await;
+
+                            for market in &next_markets {
+                                if !map.contains_key(&market.yes_token) {
+                                    info!("[SCANNER] Next: {} (starts in {}s)",
+                                          market.asset.to_uppercase(),
+                                          current_end_time.saturating_sub(now));
+                                    map.insert(market.yes_token.clone(), MarketState::new(market));
+                                }
+                            }
+
+                            info!("[SCANNER] Preloaded {} next markets | total active: {}",
+                                  next_markets.len(), map.len());
+
+                            drop(map);
+                        }
+                        Err(e) => {
+                            warn!("[SCANNER] Failed to preload next markets: {}", e);
+                        }
+                    }
+
+                    // Wait until current markets expire, then clean them up
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let time_until_expiry = current_end_time.saturating_sub(now) + 5; // +5s buffer
+
+                    if time_until_expiry > 0 {
+                        info!("[SCANNER] Waiting {}s for current markets to expire...", time_until_expiry);
+                        sleep(Duration::from_secs(time_until_expiry)).await;
+                    }
+
+                    // Remove expired current markets
+                    let mut map = scanner_markets.write().await;
+                    let before = map.len();
+
+                    map.retain(|token, _| {
+                        // Keep tokens not in expired list
+                        // Check if this token belongs to an expired market
+                        !active_markets.iter().any(|m| &m.yes_token == token || &m.no_token == token)
+                    });
+
+                    if map.len() < before {
+                        info!("[SCANNER] Cleaned up {} expired markets | {} remain",
+                              before - map.len(), map.len());
+                    }
+
+                    drop(map);
+
+                    // Loop continues to scan next interval
                 }
                 Err(e) => {
                     warn!("[SCANNER] Failed: {}", e);
+                    sleep(Duration::from_secs(10)).await;
                 }
             }
         }
@@ -206,9 +304,15 @@ async fn main() -> Result<()> {
     // WebSocket price feed task
     let ws_markets = markets.clone();
     let ws_poly_client = poly_client.clone();
+    let ws_position_channel = position_channel.clone();
     let ws_handle = tokio::spawn(async move {
         loop {
-            if let Err(e) = run_ws_feed(ws_markets.clone(), ws_poly_client.clone(), dry_run).await {
+            if let Err(e) = run_ws_feed(
+                ws_markets.clone(),
+                ws_poly_client.clone(),
+                ws_position_channel.clone(),
+                dry_run,
+            ).await {
                 error!("[WS] Disconnected: {} - reconnecting in 5s...", e);
                 sleep(Duration::from_secs(5)).await;
             }
@@ -225,6 +329,7 @@ async fn main() -> Result<()> {
 async fn run_ws_feed(
     markets: Arc<RwLock<HashMap<String, MarketState>>>,
     poly_client: Arc<SharedAsyncClient>,
+    position_channel: PositionChannel,
     dry_run: bool,
 ) -> Result<()> {
     // Get token list
@@ -278,7 +383,13 @@ async fn run_ws_feed(
                         // Try to parse as book snapshot
                         if let Ok(books) = serde_json::from_str::<Vec<BookSnapshot>>(&text) {
                             for book in &books {
-                                if let Err(e) = process_book(&markets, &poly_client, book, dry_run).await {
+                                if let Err(e) = process_book(
+                                    &markets,
+                                    &poly_client,
+                                    &position_channel,
+                                    book,
+                                    dry_run,
+                                ).await {
                                     warn!("[WS] Error processing book: {}", e);
                                 }
                             }
@@ -322,6 +433,7 @@ async fn run_ws_feed(
 async fn process_book(
     markets: &Arc<RwLock<HashMap<String, MarketState>>>,
     poly_client: &Arc<SharedAsyncClient>,
+    position_channel: &PositionChannel,
     book: &BookSnapshot,
     dry_run: bool,
 ) -> Result<()> {
@@ -379,7 +491,7 @@ async fn process_book(
 
     // Execute if arb found
     if let Some(state) = updated_market {
-        execute_arb(poly_client, &state, dry_run).await?;
+        execute_arb(poly_client, position_channel, &state, dry_run).await?;
     }
 
     Ok(())
@@ -388,6 +500,7 @@ async fn process_book(
 /// Execute arbitrage trade
 async fn execute_arb(
     poly_client: &Arc<SharedAsyncClient>,
+    position_channel: &PositionChannel,
     state: &MarketState,
     dry_run: bool,
 ) -> Result<()> {
@@ -433,6 +546,40 @@ async fn execute_arb(
             info!("      NO:  {:.2} @ {:.3} = ${:.2}",
                   no_fill.filled_size, state.no_price, no_fill.fill_cost);
             info!("      Profit: ${:.2}", actual_profit);
+
+            // Record fills to position tracker
+            let fill_yes = FillRecord::new(
+                &state.question,      // market_id (use question as unique ID)
+                &state.question,      // description
+                "polymarket",         // platform
+                "yes",                // side
+                yes_fill.filled_size, // contracts
+                state.yes_price,      // price
+                0.0,                  // fees (Polymarket has 0 maker fees!)
+                &yes_fill.order_id,
+            );
+
+            let fill_no = FillRecord::new(
+                &state.question,
+                &state.question,
+                "polymarket",
+                "no",
+                no_fill.filled_size,
+                state.no_price,
+                0.0,
+                &no_fill.order_id,
+            );
+
+            position_channel.record_fill(fill_yes);
+            position_channel.record_fill(fill_no);
+
+            // Check for unmatched exposure
+            let unmatched = (yes_fill.filled_size - no_fill.filled_size).abs();
+            if unmatched > 0.5 {
+                warn!("   ⚠️  UNMATCHED: {:.2} contracts ({} side)",
+                      unmatched,
+                      if yes_fill.filled_size > no_fill.filled_size { "YES" } else { "NO" });
+            }
         }
         (Err(e), _) | (_, Err(e)) => {
             error!("   ❌ FAILED: {}", e);

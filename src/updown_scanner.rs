@@ -106,19 +106,32 @@ impl UpDownScanner {
     ///
     /// Returns only the CURRENT active 15-minute market for each asset
     pub async fn scan_active_markets(&self) -> Result<Vec<ActiveUpDownMarket>> {
+        self.scan_markets_for_interval(0).await
+    }
+
+    /// Scan for markets N intervals ahead
+    ///
+    /// offset = 0: current interval
+    /// offset = 1: next interval (15 min ahead)
+    /// offset = -1: previous interval (15 min ago)
+    pub async fn scan_markets_for_interval(&self, offset: i32) -> Result<Vec<ActiveUpDownMarket>> {
         let now = current_timestamp();
 
-        // Generate candidate slugs for current interval only
+        // Generate candidate slugs
         let mut candidates = Vec::new();
 
         for asset in UPDOWN_ASSETS {
-            // Find the END of the current 15-minute interval
+            // Find the END of the target 15-minute interval
             // Markets are identified by their end timestamp
-            // Example: if now=6:47 PM, current interval is 6:45-7:00, end=7:00
-            let current_interval_end = ((now / MARKET_INTERVAL_SECS) + 1) * MARKET_INTERVAL_SECS;
+            let base_interval_end = ((now / MARKET_INTERVAL_SECS) + 1) * MARKET_INTERVAL_SECS;
+            let target_interval_end = if offset >= 0 {
+                base_interval_end + (offset as u64 * MARKET_INTERVAL_SECS)
+            } else {
+                base_interval_end - ((-offset) as u64 * MARKET_INTERVAL_SECS)
+            };
 
-            let slug = format!("{}-updown-15m-{}", asset, current_interval_end);
-            candidates.push((asset.to_string(), slug, current_interval_end));
+            let slug = format!("{}-updown-15m-{}", asset, target_interval_end);
+            candidates.push((asset.to_string(), slug, target_interval_end));
         }
 
         info!("[UPDOWN] Scanning {} candidate market slugs...", candidates.len());

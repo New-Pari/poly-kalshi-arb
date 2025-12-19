@@ -10,3 +10,4 @@ pub mod polymarket;
 pub mod polymarket_clob;
 pub mod position_tracker;
 pub mod types;
+pub mod updown_scanner;

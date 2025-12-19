@@ -393,9 +393,51 @@ This updates `realized_pnl` and moves position to "resolved" status.
 - `positions_updown.json` - Position tracking database
 - Logs to stdout (redirect to file if needed)
 
+## Performance & Efficiency
+
+### API Call Reduction
+
+**Old approach (polling every 30s):**
+- 30 calls per 15-minute interval
+- 2,880 calls per day
+- Wastes API quota and bandwidth
+
+**New approach (event-driven):**
+- 2 calls per 15-minute interval (1 current + 1 preload)
+- 192 calls per day
+- **93% reduction in API calls!**
+
+### Zero-Latency Interval Transitions
+
+**Without preload:**
+```
+T=15:00   Markets expire
+T=15:00   Scanner detects expiry
+T=15:01   Fetch next markets (API delay)
+T=15:01   WebSocket subscribes (connection delay)
+T=15:02   Ready to detect arbs (2 second gap!)
+```
+
+**With 60s preload:**
+```
+T=14:00   Preload fetches next markets
+T=14:00   WebSocket subscribes immediately
+T=14:00   Already monitoring next interval
+T=15:00   Markets expire
+T=15:00   Cleanup old markets
+T=15:00   Continue monitoring (zero downtime!)
+```
+
+### WebSocket Efficiency
+
+**Normal load:** 8 tokens (4 markets × 2 tokens each)
+**Peak load:** 16 tokens during 60s preload (acceptable overhead)
+**Bandwidth:** Minimal increase (~2x for 60s, then back to 1x)
+
 ## Support
 
 For issues or questions:
 - Check logs for error messages
 - Verify `.env` credentials are correct
 - Test scanner separately: `cargo run --release --bin test_updown_scanner`
+- Review scanner logs for preload/cleanup behavior

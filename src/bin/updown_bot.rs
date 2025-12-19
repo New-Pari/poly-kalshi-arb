@@ -528,8 +528,8 @@ async fn execute_arb(
     info!("   ⚡ Executing...");
     let start = Instant::now();
 
-    let yes_fut = poly_client.buy_ioc(&state.yes_token, state.yes_price, size);
-    let no_fut = poly_client.buy_ioc(&state.no_token, state.no_price, size);
+    let yes_fut = poly_client.buy_fak(&state.yes_token, state.yes_price, size);
+    let no_fut = poly_client.buy_fak(&state.no_token, state.no_price, size);
 
     let (yes_result, no_result) = tokio::join!(yes_fut, no_fut);
 
